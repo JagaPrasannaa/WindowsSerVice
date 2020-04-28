@@ -1,0 +1,638 @@
+#include <Windows.h>
+#include <tchar.h>
+#include <fstream>
+#include <iostream>
+#include <time.h>
+#include<stdio.h>
+#include <UserEnv.h>
+#include <WtsApi32.h>
+#include <Urlmon.h>
+#include<string>
+#include <stdlib.h>
+
+#pragma comment (lib,"Urlmon")
+#pragma comment (lib,"wtsapi32")
+#pragma comment (lib,"userenv")
+#pragma warning(disable : 4996) 
+#define LOGNAME_FORMAT "P:\\temp\\file_%Y%m%d_%H%M%S.html"
+#define LOGNAME_SIZE 100
+using namespace std;
+SERVICE_STATUS        g_ServiceStatus = { 0 };
+SERVICE_STATUS_HANDLE g_StatusHandle = NULL;
+HANDLE                g_ServiceStopEvent = INVALID_HANDLE_VALUE;
+
+VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv);
+VOID WINAPI ServiceCtrlHandler(DWORD);
+DWORD WINAPI ServiceWorkerThread(LPVOID lpParam);
+void ImpersonateActiveUserAndRun(WCHAR* path, WCHAR* args);
+void downloadFile(char * path_set);
+void CreatePipeForClient();
+void CreatePipeForServer();
+bool SetPrivilege(LPCWSTR lpszPrivilege, BOOL bEnablePrivilege);//Debug setting
+#define SERVICE_NAME  _T("My Sample Service")
+
+int _tmain(int argc, TCHAR* argv[])
+{
+    OutputDebugString(_T("My Sample Service: Main: Entry"));
+
+    SERVICE_TABLE_ENTRY ServiceTable[] =
+    {
+        {SERVICE_NAME, (LPSERVICE_MAIN_FUNCTION)ServiceMain},
+        {NULL, NULL}
+    };
+
+    if (StartServiceCtrlDispatcher(ServiceTable) == FALSE)
+    {
+        OutputDebugString(_T("My Sample Service: Main: StartServiceCtrlDispatcher returned error"));
+        
+        return GetLastError();
+    }
+
+    OutputDebugString(_T("My Sample Service: Main: Exit"));
+    return 0;
+}
+
+
+VOID WINAPI ServiceMain(DWORD argc, LPTSTR* argv)
+{
+    DWORD Status = E_FAIL;
+
+    OutputDebugString(_T("My Sample Service: ServiceMain: Entry"));
+
+    g_StatusHandle = RegisterServiceCtrlHandler(SERVICE_NAME, ServiceCtrlHandler);
+
+    if (g_StatusHandle == NULL)
+    {
+        OutputDebugString(_T("My Sample Service: ServiceMain: RegisterServiceCtrlHandler returned error"));
+        goto EXIT;
+    }
+
+    // Tell the service controller we are starting
+    ZeroMemory(&g_ServiceStatus, sizeof(g_ServiceStatus));
+    g_ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_ServiceStatus.dwControlsAccepted = 0;
+    g_ServiceStatus.dwCurrentState = SERVICE_START_PENDING;
+    g_ServiceStatus.dwWin32ExitCode = 0;
+    g_ServiceStatus.dwServiceSpecificExitCode = 0;
+    g_ServiceStatus.dwCheckPoint = 0;
+
+    if (SetServiceStatus(g_StatusHandle, &g_ServiceStatus) == FALSE)
+    {
+        OutputDebugString(_T("My Sample Service: ServiceMain: SetServiceStatus returned error"));
+    }
+
+    /*
+     * Perform tasks neccesary to start the service here
+     */
+    OutputDebugString(_T("My Sample Service: ServiceMain: Performing Service Start Operations"));
+
+    // Create stop event to wait on later.
+    g_ServiceStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (g_ServiceStopEvent == NULL)
+    {
+        OutputDebugString(_T("My Sample Service: ServiceMain: CreateEvent(g_ServiceStopEvent) returned error"));
+
+        g_ServiceStatus.dwControlsAccepted = 0;
+        g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+        g_ServiceStatus.dwWin32ExitCode = GetLastError();
+        g_ServiceStatus.dwCheckPoint = 1;
+
+        if (SetServiceStatus(g_StatusHandle, &g_ServiceStatus) == FALSE)
+        {
+            OutputDebugString(_T("My Sample Service: ServiceMain: SetServiceStatus returned error"));
+        }
+        goto EXIT;
+    }
+
+    // Tell the service controller we are started
+    g_ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+    g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
+    g_ServiceStatus.dwWin32ExitCode = 0;
+    g_ServiceStatus.dwCheckPoint = 0;
+
+    if (SetServiceStatus(g_StatusHandle, &g_ServiceStatus) == FALSE)
+    {
+        OutputDebugString(_T("My Sample Service: ServiceMain: SetServiceStatus returned error"));
+    }
+
+    // Start the thread that will perform the main task of the service
+    HANDLE hThread = CreateThread(NULL, 0, ServiceWorkerThread, NULL, 0, NULL);
+
+    OutputDebugString(_T("My Sample Service: ServiceMain: Waiting for Worker Thread to complete"));
+
+    // Wait until our worker thread exits effectively signaling that the service needs to stop
+    WaitForSingleObject(hThread, INFINITE);
+
+    OutputDebugString(_T("My Sample Service: ServiceMain: Worker Thread Stop Event signaled"));
+
+
+    /*
+     * Perform any cleanup tasks
+     */
+    OutputDebugString(_T("My Sample Service: ServiceMain: Performing Cleanup Operations"));
+
+    CloseHandle(g_ServiceStopEvent);
+
+    g_ServiceStatus.dwControlsAccepted = 0;
+    g_ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+    g_ServiceStatus.dwWin32ExitCode = 0;
+    g_ServiceStatus.dwCheckPoint = 3;
+
+    if (SetServiceStatus(g_StatusHandle, &g_ServiceStatus) == FALSE)
+    {
+        OutputDebugString(_T("My Sample Service: ServiceMain: SetServiceStatus returned error"));
+    }
+
+EXIT:
+    OutputDebugString(_T("My Sample Service: ServiceMain: Exit"));
+
+    return;
+}
+
+
+VOID WINAPI ServiceCtrlHandler(DWORD CtrlCode)
+{
+    OutputDebugString(_T("My Sample Service: ServiceCtrlHandler: Entry"));
+
+    switch (CtrlCode)
+    {
+    case SERVICE_CONTROL_STOP:
+
+        OutputDebugString(_T("My Sample Service: ServiceCtrlHandler: SERVICE_CONTROL_STOP Request"));
+
+        if (g_ServiceStatus.dwCurrentState != SERVICE_RUNNING)
+            break;
+
+        /*
+         * Perform tasks neccesary to stop the service here
+         */
+
+        g_ServiceStatus.dwControlsAccepted = 0;
+        g_ServiceStatus.dwCurrentState = SERVICE_STOP_PENDING;
+        g_ServiceStatus.dwWin32ExitCode = 0;
+        g_ServiceStatus.dwCheckPoint = 4;
+
+        if (SetServiceStatus(g_StatusHandle, &g_ServiceStatus) == FALSE)
+        {
+            OutputDebugString(_T("My Sample Service: ServiceCtrlHandler: SetServiceStatus returned error"));
+        }
+
+        // This will signal the worker thread to start shutting down
+        SetEvent(g_ServiceStopEvent);
+
+        break;
+
+    default:
+        break;
+    }
+
+    OutputDebugString(_T("My Sample Service: ServiceCtrlHandler: Exit"));
+}
+
+
+DWORD WINAPI ServiceWorkerThread(LPVOID lpParam)
+{
+    OutputDebugString(_T("My Sample Service: ServiceWorkerThread: Entry"));
+
+    //  Periodically check if the service has been requested to stop
+    while (WaitForSingleObject(g_ServiceStopEvent, 0) != WAIT_OBJECT_0)
+    {
+        /*
+         * Perform main service function here
+         */
+        /*std::ofstream myfile("C:\\Users\\jagap\\source\\repos\\ServiceTest\\Debug\\file3.txt");
+        time_t now = time(0);
+        char* dt = ctime(&now);
+        myfile << "the service time " << dt;
+        myfile.close();*/
+         //  Simulate some work by sleeping
+        //WCHAR path[] = L"C:\\Windows\\System32\\cmd.exe";
+        //WCHAR args[] = L"";
+        //ImpersonateActiveUserAndRun(path, args);
+        //downloadFile();
+        //CreatePipe();
+        CreatePipeForServer();
+        Sleep(3000);
+    }
+
+    OutputDebugString(_T("My Sample Service: ServiceWorkerThread: Exit"));
+
+    return ERROR_SUCCESS;
+}
+void CreatePipeForClient(void) {
+    cout << "\t\t...........Client  PIPE........." << endl;
+    HANDLE hCreateNamedPipe;
+    //Local var defenition
+    BOOL bReadFile;
+    DWORD dwNoBytesRead;
+    char szReadFileBuffer[1023];
+    DWORD dwszReadFileBuffersize = sizeof(szReadFileBuffer);
+    //WriteFile Local Var
+    BOOL bWriteFile;
+    DWORD dwNoBytesWrite;
+    char szWriteFileBuffer[1023] = "Hello from namedpipe client";
+    DWORD dwszWriteFileBuffersize = sizeof(szWriteFileBuffer);
+
+    hCreateNamedPipe = CreateFile(
+        L"\\\\.\\pipe\\MYNAMEDPIPE",
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (hCreateNamedPipe == INVALID_HANDLE_VALUE) {
+        cout << "Failed to create pipe GLE= " << GetLastError() << endl;
+    }
+    else {
+        cout << "Named pipe creation success" << endl;
+    }
+    //ReadFile
+    bReadFile = ReadFile(
+        hCreateNamedPipe,
+        szReadFileBuffer,
+        dwszReadFileBuffersize,
+        &dwNoBytesRead,
+        NULL);
+    if (bReadFile == FALSE) {
+        cout << "ReadFile failed GLE = " << GetLastError() << endl;
+    }
+    cout << "ReadFile Success" << endl;
+    cout << "Date Reading -> " << szReadFileBuffer << endl;
+    ofstream fout;
+    fout.open("P:\\temp\\fileService.txt");
+    fout << szReadFileBuffer << endl;
+    fout.close();
+
+    //Write Operation
+    bWriteFile = WriteFile(
+        hCreateNamedPipe,
+        szWriteFileBuffer,
+        dwszWriteFileBuffersize,
+        &dwNoBytesWrite,
+        NULL);
+    if (bWriteFile == FALSE) {
+        cout << "Write File failed -> GLE = " << GetLastError() << endl;
+    }
+    else {
+        cout << "Write file success" << endl;
+    }
+
+    //Dissconnet
+    DisconnectNamedPipe(hCreateNamedPipe);
+
+    //Close Handle
+    CloseHandle(hCreateNamedPipe);
+}
+
+void downloadFile(char * path_set) {
+    printf("URLDownloadToFile test function.\n");
+   // TCHAR path[LOGNAME_SIZE];
+    //time_t now = time(0);
+    //strftime((char *)path, sizeof(path), LOGNAME_FORMAT, localtime(&now));
+    OutputDebugString(_T("My Sample Service: FIle download section"));
+    TCHAR url[] = TEXT("https://www.google.com");
+    //TCHAR path[LOGNAME_SIZE] = TEXT("P:\\temp\\file_20200423_185005453.html");
+    TCHAR path[LOGNAME_SIZE];
+   
+    
+    size_t origsize = strlen(path_set) + 1;
+    const size_t newsize = 100;
+    size_t convertedChars = 0;
+    mbstowcs_s(&convertedChars, path, origsize, path_set, _TRUNCATE);
+   
+    //ofstream fout;
+    //fout.open(path_set);
+    //fout << path_set << endl;
+    //fout.close();
+    printf("Url: %S\n", url);
+    OutputDebugString(url);
+    /*for (int i = 0; i < sizeof(path_set); i++) {
+        path[i] = path_set[i];
+    }*/
+    OutputDebugString(TEXT("\n"));
+    OutputDebugString(path);
+   //GetCurrentDirectory(MAX_PATH, path);
+
+    printf("Path: %S\n", path_set);
+
+    HRESULT res = URLDownloadToFile(NULL, url, path, 0, NULL);
+
+    if (res == S_OK) {
+        OutputDebugString(_T("Ok\n"));
+    }
+    else if (res == E_OUTOFMEMORY) {
+        OutputDebugString(_T("Buffer length invalid, or insufficient memory\n"));
+    }
+    else if (res == INET_E_DOWNLOAD_FAILURE) {
+        OutputDebugString(_T("URL is invalid\n"));
+    }
+    else {
+        printf("Other error: %d\n", res);
+    }
+
+}
+
+void ImpersonateActiveUserAndRun(WCHAR* path, WCHAR* args)
+{
+    DWORD session_id = -1;
+    DWORD session_count = 0;
+    SetPrivilege(SE_DEBUG_NAME, TRUE);
+    WTS_SESSION_INFOW* pSession = NULL;
+    if (WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pSession, &session_count))
+    {
+        //log success
+    }
+    else
+    {
+        //log error
+        return;
+    }
+
+    for (DWORD i = 0; i < session_count; i++)
+    {
+        session_id = pSession[i].SessionId;
+
+        WTS_CONNECTSTATE_CLASS wts_connect_state = WTSDisconnected;
+        WTS_CONNECTSTATE_CLASS* ptr_wts_connect_state = NULL;
+
+        DWORD bytes_returned = 0;
+        if (WTSQuerySessionInformation(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSConnectState,
+            reinterpret_cast<LPTSTR*>(&ptr_wts_connect_state),
+            &bytes_returned))
+        {
+            wts_connect_state = *ptr_wts_connect_state;
+            ::WTSFreeMemory(ptr_wts_connect_state);
+            if (wts_connect_state != WTSActive)
+                continue;
+        }
+        else
+        {
+            //log error
+            continue;
+        }
+
+        HANDLE hImpersonationToken;
+
+        if (!WTSQueryUserToken(session_id, &hImpersonationToken))
+        {
+            //log error
+            continue;
+        }
+
+
+        //Get real token from impersonation token
+        DWORD neededSize1 = 0;
+        HANDLE* realToken = new HANDLE;
+        if (GetTokenInformation(hImpersonationToken, (::TOKEN_INFORMATION_CLASS) TokenLinkedToken, realToken, sizeof(HANDLE), &neededSize1))
+        {
+            CloseHandle(hImpersonationToken);
+            hImpersonationToken = *realToken;
+        }
+        else
+        {
+            std::cout << GetLastError() << endl;
+            continue;
+        }
+
+
+        HANDLE hUserToken;
+        //the token is primary one generate  duplicate token for creating environment
+        if (!DuplicateTokenEx(hImpersonationToken,
+            //0,
+            //MAXIMUM_ALLOWED,
+            TOKEN_ASSIGN_PRIMARY | TOKEN_ALL_ACCESS | MAXIMUM_ALLOWED,
+            NULL,
+            SecurityImpersonation,
+            TokenPrimary,
+            &hUserToken))
+        {
+            //log error
+
+            cout << GetLastError() << endl;
+            continue;
+        }
+
+        // Get user name of this process
+        //LPTSTR pUserName = NULL;
+        WCHAR* pUserName;
+        DWORD user_name_len = 0;
+
+        if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session_id, WTSUserName, &pUserName, &user_name_len))
+        {
+            //log username contained in pUserName WCHAR string
+
+        }
+
+        //Free memory                         
+        if (pUserName) WTSFreeMemory(pUserName);
+
+        ImpersonateLoggedOnUser(hUserToken);
+
+        STARTUPINFOW StartupInfo;
+        GetStartupInfoW(&StartupInfo);
+        StartupInfo.cb = sizeof(STARTUPINFOW);
+        WCHAR type[] = L"winsta0\\default";
+        StartupInfo.lpDesktop = type;
+
+        PROCESS_INFORMATION processInfo;
+
+        SECURITY_ATTRIBUTES Security1;
+        Security1.nLength = sizeof SECURITY_ATTRIBUTES;
+
+        SECURITY_ATTRIBUTES Security2;
+        Security2.nLength = sizeof SECURITY_ATTRIBUTES;
+
+        void* lpEnvironment = NULL;
+
+        // Get all necessary environment variables of logged in user
+        // to pass them to the new process
+        BOOL resultEnv = CreateEnvironmentBlock(&lpEnvironment, hUserToken, FALSE);
+        if (!resultEnv)
+        {
+            //log error
+            continue;
+        }
+
+        WCHAR PP[1024];
+        //path and parameters
+        ZeroMemory(PP, 1024 * sizeof WCHAR);
+        wcscpy_s(PP, path);
+        wcscat_s(PP, L" ");
+        wcscat_s(PP, args);
+        // Start the process on behalf of the current user 
+        /*BOOL result = CreateProcessAsUserW(hUserToken, NULL, PP, NULL, NULL, FALSE, NORMAL_PRIORITY_CLASS | CREATE_NEW_CONSOLE, NULL, NULL, &StartupInfo, &processInfo);
+
+        if (!result)
+        {
+            //log error
+
+            cout << GetLastError() << endl;
+        }
+        else
+        {
+            //log success
+        }*/
+        
+        //CreatePipeForClient();
+        //CreatePipeForServer();
+        DestroyEnvironmentBlock(lpEnvironment);
+
+        CloseHandle(hImpersonationToken);
+        CloseHandle(hUserToken);
+        CloseHandle(realToken);
+
+        RevertToSelf();
+    }
+
+    WTSFreeMemory(pSession);
+}
+
+void CreatePipeForServer() {
+
+    cout << "\t\t..........Namedpipe server........." << endl;
+    //Security Descripter
+    PSECURITY_DESCRIPTOR psd = NULL;
+    BYTE  sd[SECURITY_DESCRIPTOR_MIN_LENGTH];
+    psd = (PSECURITY_DESCRIPTOR)sd;
+    InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(psd, TRUE, (PACL)NULL, FALSE);
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), psd, FALSE };
+
+
+
+    //Name pipe local var
+    HANDLE hCreateNamedpipe;
+    char szInputBuffer[1023];
+    char szOutputBuffer[1023];
+    DWORD dwszInputBuffer = sizeof(szInputBuffer);
+    DWORD dwszOutputBuffer = sizeof(szOutputBuffer);
+    BOOL bConnectNamedPipe;
+    // ConnectNAmedPirpe Local Var
+    //Write file local var
+    BOOL bWritefile;
+    char szWriteFileBuffer[1023] = "ya received Test ing g..";
+    DWORD dwWrtieBufferSize = sizeof(szWriteFileBuffer);
+    DWORD dwNoBytesWrite;
+
+    //FLUSH Local Var
+    BOOL bFlushFileBuffer;
+    //Read local var
+    BOOL bReadfile;
+    char szReadFileBuffer[1023];
+    DWORD dwReadBufferSize = sizeof(szReadFileBuffer);
+    DWORD dwNoBytesRead;
+
+    //CreateNamedPiep 
+    hCreateNamedpipe = CreateNamedPipe(
+        L"\\\\.\\pipe\\MYNAMEDPIPE",
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES,
+        dwszOutputBuffer,
+        dwszInputBuffer,
+        0, &sa);
+    if (hCreateNamedpipe == INVALID_HANDLE_VALUE) {
+        cout << "Failed to create pipe GLE= " << GetLastError() << endl;
+    }
+    else {
+        cout << "Named pipe creation success" << endl;
+    }
+
+    //Connect pipe
+    bConnectNamedPipe = ConnectNamedPipe(hCreateNamedpipe, NULL);
+    if (bConnectNamedPipe == FALSE) {
+        cout << "Connection failed to pipe GLE= " << GetLastError() << endl;
+    }
+    cout << "Connection established successfully" << endl;
+    //ReadFile
+    bReadfile = ReadFile(
+        hCreateNamedpipe,
+        szReadFileBuffer,
+        dwReadBufferSize,
+        &dwNoBytesRead,
+        NULL);
+    if (bReadfile == FALSE) {
+        cout << "ReadFile failed GLE = " << GetLastError() << endl;
+    }
+    cout << "ReadFile Success" << endl;
+    cout << "Data read -> " << szReadFileBuffer << endl;
+    int num = atoi(szReadFileBuffer);
+    static char name[LOGNAME_SIZE];
+    for (int i = 0; i < num; i++) {
+        time_t now = time(0);
+        strftime(name, sizeof(name), LOGNAME_FORMAT, localtime(&now));
+        //cout << name << endl;
+        OutputDebugString(_T("hello"));
+       // OutputDebugString((LPCWSTR)name);
+        /*ofstream fout;
+        fout.open(name);
+        fout << name << endl;
+        fout << num << endl;
+        fout.close();*/
+        downloadFile(name);
+        Sleep(1000);
+    }
+   
+
+    //Write Operation
+    bWritefile = WriteFile(
+        hCreateNamedpipe,
+        szWriteFileBuffer,
+        dwWrtieBufferSize,
+        &dwNoBytesWrite,
+        NULL);
+    if (bWritefile == FALSE) {
+        cout << "Write File failed -> GLE = " << GetLastError() << endl;
+    }
+    else {
+        cout << "Write file success" << endl;
+    }
+    bFlushFileBuffer = FlushFileBuffers(hCreateNamedpipe);
+    if (bFlushFileBuffer == FALSE) {
+        cout << "Flush File Buffer failed GLE = " << GetLastError() << endl;
+    }
+    cout << "FlushFileBuffer Success" << endl;
+    
+
+
+    //Dissconnet
+    DisconnectNamedPipe(hCreateNamedpipe);
+
+    //Close Handle
+    CloseHandle(hCreateNamedpipe);
+}
+
+//
+//  SetPrivilege enables/disables process token privilege.
+//
+bool SetPrivilege(LPCWSTR lpszPrivilege, BOOL bEnablePrivilege) {
+    TOKEN_PRIVILEGES priv = { 0,0,0,0 };
+    HANDLE hToken = NULL;
+    LUID luid = { 0,0 };
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+        if (hToken)
+            CloseHandle(hToken);
+        return false;
+    }
+    if (!LookupPrivilegeValueW(0, lpszPrivilege, &luid)) {
+        if (hToken)
+            CloseHandle(hToken);
+        return false;
+    }
+    priv.PrivilegeCount = 1;
+    priv.Privileges[0].Luid = luid;
+    priv.Privileges[0].Attributes = bEnablePrivilege ? SE_PRIVILEGE_ENABLED : SE_PRIVILEGE_REMOVED;
+    if (!AdjustTokenPrivileges(hToken, false, &priv, 0, 0, 0)) {
+        if (hToken)
+            CloseHandle(hToken);
+        return false;
+    }
+    if (hToken)
+        CloseHandle(hToken);
+    return true;
+}
